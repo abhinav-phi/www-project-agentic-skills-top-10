@@ -58,7 +58,8 @@ Fill in for incidents where legitimate agents/skills exercised authority beyond 
 
 - Originating principal and consent record:
 - Delegation chain (user → agent → delegated agent → skill → tool):
-- Transition states per hop (inherited/narrowed/rejected/revoked/amplified/unverifiable):
+- Transition states per hop (inherited/narrowed/rejected/revoked/expanded-authorized/amplified/unverifiable):
+- Authority delta and authorization basis per hop (where a delta exists):
 - First amplification hop and mechanism:
 - Effective runtime authority at time of action:
 - Containment boundary used and revocation verification result:

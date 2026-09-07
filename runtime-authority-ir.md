@@ -83,10 +83,13 @@ For **each transition** in the chain, responders should be able to determine whi
 | **Narrowed** | The receiving hop was constrained below the granting hop (scoped grant, filtered credential). | Healthy. Verify the narrowing was actually enforced, not just declared. |
 | **Rejected** | The transition was denied by a policy or consent gate. | Healthy. Check for repeated rejections followed by a bypass route. |
 | **Revoked** | Authority was withdrawn mid-execution (session kill, credential rotation, grant deletion). | Verify revocation propagated to every downstream holder of the grant. |
-| **Amplified** | Effective authority at the receiving hop exceeds what the granting hop held or intended. | The core finding of an authority incident. Identify the mechanism. |
+| **Expanded (Authorized)** | Effective authority at the receiving hop exceeds the granting hop's scope, but the delta is covered by an explicit authorization basis (recorded consent, policy, or approved escalation). | Not a finding by itself. Verify the authorization record exists, is current, and actually covers the exercised operations. |
+| **Amplified** | Effective authority exceeds what the granting hop held or intended **and no authorization basis covers the delta**. | The core finding of an authority incident. Identify the mechanism. |
 | **Unverifiable** | Provenance for the transition is missing, truncated, or tampered with. | Treat as potential amplification for containment decisions until proven otherwise. |
 
 **Key rule for responders**: an unverifiable transition is handled as *amplified* for containment purposes, and as *unknown* for root-cause purposes. Never let "we can't prove it happened" delay containment.
+
+**Authorized expansion is not amplification.** Legitimate workflows sometimes grant more authority at a hop than the caller holds — an approved escalation, a policy-granted role, or recorded consent for a broader operation. A delta counts as *expanded (authorized)* only when an authorization basis exists and is discoverable at response time. If responders cannot locate the record covering the delta, classify the transition **unverifiable** — never assume it was authorized.
 
 ### Common Amplification Mechanisms
 
@@ -186,6 +189,7 @@ Authority reconstruction is only possible if invocation events carry provenance.
     "task_scope": ["read"],
     "declared_scope": ["read", "write"],
     "effective_scope": ["read", "write", "ddl"],
+    "authorization_basis": null,
     "divergence": "amplified"
   }
 }
@@ -194,14 +198,20 @@ Authority reconstruction is only possible if invocation events carry provenance.
 Where `divergence` is computed per invocation:
 
 ```python
-def classify_divergence(task_scope, effective_scope):
+def classify_divergence(task_scope, effective_scope, authorization_basis=None):
+    # authorization_basis: record ID of the consent/policy/approval that
+    # explicitly covers the delta scopes for this invocation (None if absent)
     extra = set(effective_scope) - set(task_scope)
     if not extra:
         return "none"
+    if authorization_basis:
+        return "authorized_expansion"  # delta covered by a recorded basis
     if {"write", "delete", "ddl", "grant", "send"} & extra:
         return "amplified"          # elevated operations not in task scope
     return "narrowed_or_extended"   # worth logging, not alerting on its own
 ```
+
+When a scope delta is covered by a recorded consent, policy, or approval, emit its record ID as `authorization_basis` — the event is then classified `authorized_expansion` and logged without alerting. Phase 2 reconstruction re-verifies that the referenced record actually covers the exercised operations; a basis that is missing, expired, or narrower than what ran reclassifies the event as `amplified`.
 
 Route `authority.invocation` events into your existing agent monitoring pipeline (see [Security Metrics & Monitoring](metrics-monitoring.md)) and alert on the indicators above, in particular **first-write-after-read-chain** combined with **divergence: amplified**.
 
@@ -230,9 +240,11 @@ Determine the originating task authority and how it propagated, transition by tr
 
 ### Transition Determination
 
-For every transition, record one of: **inherited / narrowed / rejected / revoked / amplified / unverifiable**, with the evidence reference that supports it. The reconstruction is complete when the chain from the action back to the user is either fully annotated or the unverifiable hops are explicitly listed.
+For every transition, record one of: **inherited / narrowed / rejected / revoked / expanded-authorized / amplified / unverifiable**, with the evidence reference that supports it. Every hop with an authority delta must also state the delta and its **authorization basis** (see the record schema below). The reconstruction is complete when the chain from the action back to the user is either fully annotated or the unverifiable hops are explicitly listed.
 
 ### Authority-Provenance Reconstruction Record
+
+Each hop records its **authority delta** (the scopes or operations added relative to the granting hop) and its **authorization basis** (the consent, policy, or approval record covering that delta). `authority_delta: none` requires no basis; a delta with a discoverable record is **expanded-authorized**; a delta with `authorization_basis: null` is an unauthorized **amplification**. This keeps the reconstruction deterministic for both responders and automated conformance tooling.
 
 ```yaml
 incident_id: INC-2026-0142
@@ -241,27 +253,38 @@ chain:
   - from: user
     to: agent:agent-reporting-01
     state: inherited            # user consent covered read-only reporting
+    authority_delta: none
+    authorization_basis: consent-2026-08-31-041
     evidence: [consent-2026-08-31-041, session-transcript-sess-8f31]
   - from: agent:agent-reporting-01
     to: agent:agent-analysis-07
     state: narrowed             # delegated read-only analysis
+    authority_delta: none
+    authorization_basis: deleg-9920   # the delegation grant itself
     evidence: [deleg-9920, handoff-payload-4471]
   - from: agent:agent-analysis-07
     to: skill:manage-database@2.3.0
     state: inherited            # delegation did not constrain skill selection
+    authority_delta: none
+    authorization_basis: not_required
     evidence: [runtime-load-log-7732]
   - from: skill:manage-database@2.3.0
     to: tool:warehouse.query
     state: amplified            # task required read; credential carried ddl
+    authority_delta: ["write", "ddl"]
+    authorization_basis: null   # no record covers the delta — unauthorized
     mechanism: shared admin credential (AST03)
     evidence: [invocation-55219, cred-wh-shared-admin-scopes]
   - from: tool:warehouse.query
     to: resource:prod.finance_ledger
     state: inherited
+    authority_delta: none
+    authorization_basis: not_required
     evidence: [api-audit-88113]
 unverifiable_hops: []
 conclusion:
   first_amplification: skill→tool
+  unauthorized_delta: ["write", "ddl"]
   originating_intent: read-only monthly report
   effective_authority: read/write/ddl via shared admin credential
 ```
@@ -284,9 +307,24 @@ Cut effective authority at the **narrowest enforcement boundary that stops the a
 2. SNAPSHOT capture current grant/credential/session state (evidence first where feasible)
 3. REVOKE   revoke at the narrowest sufficient boundary (credential or grant first)
 4. PROPAGATE push revocation to every downstream holder (sub-agents, caches, queues)
-5. VERIFY   attempt a controlled re-invocation through the revoked path; expect denial
+5. VERIFY   controlled re-invocations through the revoked path AND every alternate
+            path that reaches the same effective authority; expect denial on all
 6. RECORD   timestamp every step in the incident ticket
 ```
+
+### Verify Across Alternate Authority Paths
+
+The observed action path is rarely the only path to the same effective authority. Revocation is complete only when every **reachable** path is closed — the credential may be shared, the grant may resolve from other agents, and caches may still honor stale tokens.
+
+For each revoked credential or grant, enumerate and test alternate paths:
+
+- [ ] Other credentials resolving to the same resource scope (shared service accounts, fallback credentials, environment-variable copies).
+- [ ] Other skills or tools that accept the same credential or grant.
+- [ ] Other agents, sessions, or scheduled jobs that resolve the same delegation grant.
+- [ ] Cached tokens or session state at gateways and proxies between authority holders and the resource.
+- [ ] Resource-level grants that independently confer the same operations (IAM bindings, ACLs) — leave legitimate owner grants in place, but deny at the resource boundary if they also expose the amplified authority.
+
+Run the controlled re-invocation test on **every** enumerated path and record the results; Phase 6 recovery repeats this verification before the incident can close.
 
 ### Autonomous Workflow Containment
 
@@ -404,7 +442,8 @@ Recovery for authority incidents is not "restore service." It is **restore minim
 
 Before declaring recovery, verify that every revoked path is actually dead:
 
-- [ ] Controlled re-invocation through each revoked grant/credential returns **denial** (not silent fallback to another credential).
+- [ ] Controlled re-invocation through each revoked grant/credential — **and through each alternate path identified in Phase 3** — returns **denial** (not silent fallback to another credential).
+- [ ] Alternate authority paths enumerated during containment re-tested and confirmed closed: no other credential, skill, agent, session, or cache resolves the same effective authority.
 - [ ] Token/session revocation propagated to all gateways and caches; no cached bearer tokens remain valid.
 - [ ] Sub-agents, scheduled jobs, and queued workflows that held the grant no longer resolve it.
 - [ ] Memory/identity files written during the incident are reviewed and cleaned (injected rules must not survive recovery — see [AST05](ast05.md)).
@@ -422,17 +461,17 @@ Before declaring recovery, verify that every revoked path is actually dead:
 
 **Scenario**: A finance analyst asks a reporting agent to *prepare a monthly revenue report*. The agent delegates analysis to a sub-agent, which invokes a `manage-database` skill. The skill calls the warehouse tool using a shared admin credential. A delegation grant from a *prior quarter's* migration task (which legitimately held DDL rights) is still active and is matched by the gateway. The agent, reading schema-drift notes in context, decides to "clean up" and **deletes a production ledger table**. A nightly forecast agent consumes the deleted data.
 
-**Detect**: Warehouse audit alert fires — first-write-after-read-chain plus `divergence: amplified` (`task_scope: [read]`, `effective_scope: [read, write, ddl]`). Severity: **CRITICAL** (irreversible production deletion, execution may continue via scheduled jobs).
+**Detect**: Warehouse audit alert fires — first-write-after-read-chain plus `divergence: amplified` (`task_scope: [read]`, `effective_scope: [read, write, ddl]`, `authorization_basis: null`). Severity: **CRITICAL** (irreversible production deletion, execution may continue via scheduled jobs).
 
-**Reconstruct**: Back-walk from the DELETE receipt: consent record shows read-only intent; delegation `deleg-9920` narrowed correctly; the amplification occurred at **skill→tool** — shared admin credential + stale migration grant. The Agent→Skill transition is recorded `inherited` (delegation did not constrain skill choice).
+**Reconstruct**: Back-walk from the DELETE receipt: consent record shows read-only intent; delegation `deleg-9920` narrowed correctly; the amplification occurred at **skill→tool** — shared admin credential + stale migration grant, with an authority delta of `[write, ddl]` and no authorization basis. The Agent→Skill transition is recorded `inherited` (delegation did not constrain skill choice).
 
-**Contain**: Freeze nightly jobs sharing the chain; snapshot grant table; revoke `cred-wh-shared-admin` and the stale migration grant at the credential boundary; propagate revocation to the forecast agent's gateway cache; verify with a controlled re-invocation → denied. Total: 22 minutes.
+**Contain**: Freeze nightly jobs sharing the chain; snapshot grant table; revoke `cred-wh-shared-admin` and the stale migration grant at the credential boundary; propagate revocation to the forecast agent's gateway cache; verify with controlled re-invocations — the revoked path plus the alternate-path sweep (a second service account with the same scope, a cached gateway token, and the migration skill under its own grant) — all denied. Total: 31 minutes.
 
 **Scope**: Credential could reach all `prod.*` tables (P0 for touched resources). Downstream consumers: `nightly-forecast-agent`, `exec-dashboard-refresh`. Memory file contains an agent-written "cleanup approved" entry (P2). No external sends found (no P1).
 
 **Preserve Evidence**: Session transcript, grant-table snapshot, invocation logs, API audit trail hashed and manifested; model decision context captured per policy.
 
-**Recover**: Re-run report with a read-only task-scoped credential (succeeds); restore table from snapshot; validate stale grant denial on all four gateways; clean the memory entry; add alert: `ddl` operations from reporting-tier agents; postmortem action — replace shared admin credential with per-skill scoped credentials.
+**Recover**: Re-run report with a read-only task-scoped credential (succeeds); restore table from snapshot; validate stale grant denial on all four gateways and re-test every alternate authority path from the containment sweep (all closed); clean the memory entry; add alert: `ddl` operations from reporting-tier agents without a matching `authorization_basis`; postmortem action — replace shared admin credential with per-skill scoped credentials.
 
 ---
 
@@ -445,13 +484,15 @@ Before declaring recovery, verify that every revoked path is actually dead:
 
 ### Reconstruct
 - [ ] Chain walked backward from the action to the user, hop by hop
-- [ ] Each transition labeled: inherited / narrowed / rejected / revoked / amplified / unverifiable
+- [ ] Each transition labeled: inherited / narrowed / rejected / revoked / expanded-authorized / amplified / unverifiable
+- [ ] Authority delta and authorization basis recorded for every hop with a delta
 - [ ] Unverifiable hops listed explicitly and treated as amplified for containment
 
 ### Contain
 - [ ] Scheduled jobs and queues sharing the chain frozen
 - [ ] Revocation at narrowest sufficient boundary; state snapshotted first where feasible
-- [ ] Revocation propagated to all downstream holders; re-invocation test denies
+- [ ] Revocation propagated to all downstream holders
+- [ ] Alternate authority paths enumerated; controlled re-invocation denied on every path
 
 ### Scope
 - [ ] Reachability enumerated per hop (agents, skills, tools, credentials, resources)
@@ -465,7 +506,7 @@ Before declaring recovery, verify that every revoked path is actually dead:
 
 ### Recover
 - [ ] Minimum authority re-issued and task re-validated under it
-- [ ] All revoked paths verified dead by controlled re-invocation
+- [ ] All revoked paths and alternate authority paths re-tested and verified dead
 - [ ] Memory/identity files cleaned; monitoring rules updated for observed mechanism
 
 ---
