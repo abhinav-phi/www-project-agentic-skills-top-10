@@ -525,22 +525,27 @@ Follow the six-phase workflow (detailed procedures, evidence tables, and templat
 ```
 Detect      → authority telemetry, task–action divergence alerts
 Reconstruct → back-walk the authority chain; label each hop
-              inherited / narrowed / rejected / revoked / amplified / unverifiable
-Contain     → revoke at the narrowest sufficient boundary; freeze
-              schedules/queues; propagate and verify revocation
+              inherited / narrowed / rejected / revoked /
+              expanded (authorized) / amplified / unverifiable
+Contain     → gate amplified operations at the resource (point of
+              effect); freeze schedules/queues; revoke at the narrowest
+              sufficient boundary; propagate; verify across alternate
+              authority paths
 Scope       → enumerate downstream reachability (agents, skills,
               tools, credentials, resources, data consumers)
 Preserve    → capture volatile authority state before teardown
 Recover     → least-privilege restoration; verify stale authority is dead
+              across all alternate authority paths
 ```
 
-**Key rule**: an unverifiable authority transition is treated as *amplified* for containment and *unknown* for root-cause analysis.
+**Key rules**: an unverifiable authority transition is treated as *amplified* for containment and *unknown* for root-cause analysis; and **revocation ≠ undo** — upstream revocation stops future propagation but cannot reach an action that already hit the resource, so gate irreversible operations at the point of effect and hand already-executed actions to recovery.
 
 ### Immediate Actions (first 30 minutes)
 1. Freeze scheduled/cron jobs and workflow queues that share the authority chain.
-2. Identify the narrowest enforcement boundary (credential → skill → session → resource) that stops the action path.
+2. Enable a point-of-effect deny at the resource for the amplified operations — first, when the operations are irreversible (the only gate that stops the next action).
 3. Snapshot grant/credential/session state before revoking, where execution has already completed.
-4. Revoke, propagate to all downstream holders, and verify with a controlled re-invocation (expect denial).
+4. Revoke at the narrowest sufficient boundary, propagate to all downstream holders, and verify with controlled re-invocations across the revoked path and alternate authority paths (expect denial).
+5. List actions already executed at the resource and hand them to scoping/recovery — revocation does not undo them.
 
 **Full guidance**: [Runtime Authority Incident Response](runtime-authority-ir.md) — authority-chain reconstruction, per-hop evidence collection, downstream impact analysis, and least-privilege recovery procedures.
 

@@ -221,6 +221,8 @@ Route `authority.invocation` events into your existing agent monitoring pipeline
 2. Which authority hop is closest to the harmful action (skill, tool, credential)?
 3. Is the action reversible at the resource level (soft delete, snapshot, backup)?
 
+Question 1 decides whether containment must include **point-of-effect gating** (in-flight actions cannot be stopped by upstream revocation alone). Question 3 decides whether containment is meaningful at all: for **irreversible** operations the resource gate moves first, and already-landed actions are treated as recovery work, not containment.
+
 ---
 
 ## Phase 2: Reconstruct
@@ -293,23 +295,48 @@ conclusion:
 
 ## Phase 3: Contain
 
+Containment has **two distinct jobs**, and conflating them is the most common failure of authority-incident response:
+
+1. **Stop propagation** — upstream revocation (credential, grant, skill, session) prevents *future* invocations from the affected paths. It cannot reach an action already dispatched to or committed at the resource.
+2. **Gate at the point of effect** — a resource-level gate evaluated at action-execution time is the only control that stops an operation *at the moment it runs*.
+
+**Revocation ≠ undo.** For the core incident class this playbook addresses — a legitimate agent exercising legitimate capability past user intent — the harmful action has usually **already landed** by the time containment begins. Those executed actions are *not* containment work: hand them immediately to Phase 4 (Scope) and Phase 6 (Recover, e.g., backup restore) and do not let revocation activity create the impression the harm is being rolled back.
+
+### Enforcement Boundaries
+
 Cut effective authority at the **narrowest enforcement boundary that stops the action path**, in this order of preference:
 
-1. **Credential / grant boundary** — rotate or revoke the specific credential or delegation grant on the action path. Narrowest and fastest.
-2. **Skill execution boundary** — suspend the skill runtime or disable the skill for the affected session/tenant.
-3. **Agent session boundary** — terminate the agent session and drain its work queue.
-4. **Resource boundary** — deny at the resource (ACL, policy engine) when upstream boundaries are unverifiable or shared.
+1. **Credential / grant boundary** — rotate or revoke the specific credential or delegation grant on the action path. Narrowest and fastest; stops future propagation only.
+2. **Skill execution boundary** — suspend the skill runtime or disable the skill for the affected session/tenant; stops future propagation only.
+3. **Agent session boundary** — terminate the agent session and drain its work queue; stops queued-but-unexecuted actions.
+4. **Resource boundary (point of effect)** — deny at the resource (policy engine, ACL, deny rule) evaluated **at action-execution time**; the only boundary that gates the operation as it runs.
+
+**Order inversion for irreversible operations**: when the operations at risk are destructive or irreversible (deletion, fund movement, external send, credential creation), enable the **resource boundary first** — it is the only gate that can stop the next identical action — then work upstream to close propagation paths.
+
+### Point-of-Effect Gating
+
+Upstream revocation *invalidates* authority; a point-of-effect gate *enforces* that invalidation where the action executes. For every resource class reachable through the amplified authority, deploy a gate that evaluates — per operation, at execution time — at minimum:
+
+- the **current validity** of the credential, grant, and session on the invocation path (a revoked grant fails closed here even if a cache or fallback path still resolves it);
+- the **task scope and authorization basis** for the requested operation (an `authorization_basis: null` delta such as `ddl` from a reporting-tier principal is denied);
+- the **operation class** against the resource (deny lists for destructive operations by principal tier).
+
+This directly complements the alternate-path verification below: alternate paths that are discovered *after* the gate is in place are already closed, because the gate re-evaluates current authority state on every call rather than trusting path-level resolution.
 
 ### Emergency Revocation Sequence
 
 ```text
 1. FREEZE   pause scheduled/cron agent jobs and workflow queues that share the chain
 2. SNAPSHOT capture current grant/credential/session state (evidence first where feasible)
-3. REVOKE   revoke at the narrowest sufficient boundary (credential or grant first)
-4. PROPAGATE push revocation to every downstream holder (sub-agents, caches, queues)
-5. VERIFY   controlled re-invocations through the revoked path AND every alternate
+3. GATE     enable point-of-effect deny at the resource for the amplified operations
+            (FIRST for irreversible operations — revocation alone cannot stop a
+            dispatched action and cannot undo one that already landed)
+4. REVOKE   revoke at the narrowest sufficient boundary (credential or grant first)
+5. PROPAGATE push revocation to every downstream holder (sub-agents, caches, queues)
+6. VERIFY   controlled re-invocations through the revoked path AND every alternate
             path that reaches the same effective authority; expect denial on all
-6. RECORD   timestamp every step in the incident ticket
+7. RECORD   timestamp every step in the incident ticket; list actions already
+            executed at the resource and hand them to Scope/Recover
 ```
 
 ### Verify Across Alternate Authority Paths
@@ -452,6 +479,7 @@ Before declaring recovery, verify that every revoked path is actually dead:
 ### Re-Baseline
 
 - [ ] Update skill permission manifests and delegation policies with scope-reduction lessons learned.
+- [ ] Convert the temporary point-of-effect deny rule into standing policy where appropriate (e.g., no `ddl` from reporting-tier principals); remove gates that were purely incident-scoped.
 - [ ] Add monitoring rules for the amplification mechanism observed (e.g., alert on `ddl` scope use by reporting agents).
 - [ ] Record root cause and preventive actions in the blameless postmortem per [Playbook 1, Step 8](incident-response.md#step-8-post-incident-review-1-week).
 
@@ -465,13 +493,13 @@ Before declaring recovery, verify that every revoked path is actually dead:
 
 **Reconstruct**: Back-walk from the DELETE receipt: consent record shows read-only intent; delegation `deleg-9920` narrowed correctly; the amplification occurred at **skill→tool** — shared admin credential + stale migration grant, with an authority delta of `[write, ddl]` and no authorization basis. The Agent→Skill transition is recorded `inherited` (delegation did not constrain skill choice).
 
-**Contain**: Freeze nightly jobs sharing the chain; snapshot grant table; revoke `cred-wh-shared-admin` and the stale migration grant at the credential boundary; propagate revocation to the forecast agent's gateway cache; verify with controlled re-invocations — the revoked path plus the alternate-path sweep (a second service account with the same scope, a cached gateway token, and the migration skill under its own grant) — all denied. Total: 31 minutes.
+**Contain**: The DELETE has already landed and is irreversible at the resource until snapshot restore — containment therefore gates first: a point-of-effect deny rule blocks `ddl`/write on `prod.*` for reporting-tier principals at the warehouse gateway (the next identical action now fails). Freeze nightly jobs sharing the chain; snapshot grant table; revoke `cred-wh-shared-admin` and the stale migration grant at the credential boundary; propagate revocation to the forecast agent's gateway cache; verify with controlled re-invocations — the revoked path plus the alternate-path sweep (a second service account with the same scope, a cached gateway token, and the migration skill under its own grant) — all denied at the point of effect. The landed DELETE is handed to recovery (snapshot restore). Total: 31 minutes.
 
 **Scope**: Credential could reach all `prod.*` tables (P0 for touched resources). Downstream consumers: `nightly-forecast-agent`, `exec-dashboard-refresh`. Memory file contains an agent-written "cleanup approved" entry (P2). No external sends found (no P1).
 
 **Preserve Evidence**: Session transcript, grant-table snapshot, invocation logs, API audit trail hashed and manifested; model decision context captured per policy.
 
-**Recover**: Re-run report with a read-only task-scoped credential (succeeds); restore table from snapshot; validate stale grant denial on all four gateways and re-test every alternate authority path from the containment sweep (all closed); clean the memory entry; add alert: `ddl` operations from reporting-tier agents without a matching `authorization_basis`; postmortem action — replace shared admin credential with per-skill scoped credentials.
+**Recover**: Re-run report with a read-only task-scoped credential (succeeds); restore table from snapshot (mitigation for the landed DELETE — revocation could not undo it); validate stale grant denial on all four gateways and re-test every alternate authority path from the containment sweep (all closed); keep or convert the point-of-effect deny rule into standing policy; clean the memory entry; add alert: `ddl` operations from reporting-tier agents without a matching `authorization_basis`; postmortem action — replace shared admin credential with per-skill scoped credentials.
 
 ---
 
@@ -490,9 +518,11 @@ Before declaring recovery, verify that every revoked path is actually dead:
 
 ### Contain
 - [ ] Scheduled jobs and queues sharing the chain frozen
+- [ ] Point-of-effect deny enabled at the resource (first, for irreversible operations)
 - [ ] Revocation at narrowest sufficient boundary; state snapshotted first where feasible
 - [ ] Revocation propagated to all downstream holders
 - [ ] Alternate authority paths enumerated; controlled re-invocation denied on every path
+- [ ] Already-executed actions at the resource listed and handed to Scope/Recover (revocation does not undo them)
 
 ### Scope
 - [ ] Reachability enumerated per hop (agents, skills, tools, credentials, resources)

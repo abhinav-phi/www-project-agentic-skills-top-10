@@ -63,6 +63,7 @@ Fill in for incidents where legitimate agents/skills exercised authority beyond 
 - First amplification hop and mechanism:
 - Effective runtime authority at time of action:
 - Containment boundary used and revocation verification result:
+- Point-of-effect gating applied and already-executed actions handed to recovery:
 - Stale grants/credentials discovered and invalidated:
 
 ## Preventive Actions
