@@ -323,6 +323,8 @@ Upstream revocation *invalidates* authority; a point-of-effect gate *enforces* t
 
 This directly complements the alternate-path verification below: alternate paths that are discovered *after* the gate is in place are already closed, because the gate re-evaluates current authority state on every call rather than trusting path-level resolution.
 
+Staleness is part of this gate: a cache or replica hit is not proof that the authority state is current. Where the gate cannot establish that the state it evaluated is still current with respect to the authoritative transition history — for example, when only a possibly-stale cache is reachable — it fails closed. How an implementation establishes currentness (generations, sequencing, or another mechanism) remains an open question in Issue #71 and is being worked through toward a separate conformance artifact, not decided here.
+
 ### Emergency Revocation Sequence
 
 ```text
@@ -605,4 +607,4 @@ Add the following section to the [Incident Report Template](incident-template.md
 
 ---
 
-*Drafted August 2026 for community review. Developed collaboratively in Issue #71 — runtime-authority modeling, containment/revocation detail, and chain-reconstruction deep-dives are being expanded in parallel by the co-contributors.*
+*Drafted August 2026 for community review. Developed collaboratively in Issue #71 — runtime-authority modeling, containment/revocation detail, and chain-reconstruction deep-dives are being expanded in parallel by the co-contributors. Reservation generations, protected-effect identity, retry/re-authorization binding, and staleness/freshness bounds remain open design questions in Issue #71 (toward a separate conformance artifact) and are not decided by this playbook.*
