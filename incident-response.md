@@ -542,7 +542,7 @@ Recover     → least-privilege restoration; verify stale authority is dead
 
 ### Immediate Actions (first 30 minutes)
 1. Freeze scheduled/cron jobs and workflow queues that share the authority chain.
-2. Enable a point-of-effect deny at the resource for the amplified operations — first, when the operations are irreversible (the only gate that stops the next action).
+2. Enable a point-of-effect deny at the resource for the amplified operations — first, when the operations are irreversible. Enforcement covers only paths that actually traverse the gate; verify coverage rather than assuming every subsequent action is blocked.
 3. Snapshot grant/credential/session state before revoking, where execution has already completed.
 4. Revoke at the narrowest sufficient boundary, propagate to all downstream holders, and verify with controlled re-invocations across the revoked path and alternate authority paths (expect denial).
 5. List actions already executed at the resource and hand them to scoping/recovery — revocation does not undo them.

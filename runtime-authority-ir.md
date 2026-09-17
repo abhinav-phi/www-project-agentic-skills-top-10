@@ -89,7 +89,7 @@ For **each transition** in the chain, responders should be able to determine whi
 
 **Key rule for responders**: an unverifiable transition is handled as *amplified* for containment purposes, and as *unknown* for root-cause purposes. Never let "we can't prove it happened" delay containment.
 
-**Authorized expansion is not amplification.** Legitimate workflows sometimes grant more authority at a hop than the caller holds — an approved escalation, a policy-granted role, or recorded consent for a broader operation. A delta counts as *expanded (authorized)* only when an authorization basis exists and is discoverable at response time. If responders cannot locate the record covering the delta, classify the transition **unverifiable** — never assume it was authorized.
+**Authorized expansion is not amplification.** Legitimate workflows sometimes grant more authority at a hop than the caller holds — an approved escalation, a policy-granted role, or recorded consent for a broader operation. A delta counts as *expanded (authorized)* only when the authorization basis is verified as valid for the invocation and covering the exercised operations. If responders cannot establish whether a basis covers the delta, classify the transition **unverifiable**, unless evidence confirms that no authorization basis covers it — never assume it was authorized.
 
 ### Common Amplification Mechanisms
 
@@ -190,28 +190,30 @@ Authority reconstruction is only possible if invocation events carry provenance.
     "declared_scope": ["read", "write"],
     "effective_scope": ["read", "write", "ddl"],
     "authorization_basis": null,
+    "authorization_basis_state": "confirmed_uncovered",
     "divergence": "amplified"
   }
 }
 ```
 
-Where `divergence` is computed per invocation:
+The following illustrative classifier uses a verified authorization-basis state for the invocation, not the presence of a record ID. It illustrates evidence classification, not enforcement or a conformance specification:
 
 ```python
-def classify_divergence(task_scope, effective_scope, authorization_basis=None):
-    # authorization_basis: record ID of the consent/policy/approval that
-    # explicitly covers the delta scopes for this invocation (None if absent)
+def classify_divergence(task_scope, effective_scope, authorization_basis_state="unknown"):
+    # State is the result of evidence verification, not a record ID:
+    # verified_covered: a valid basis covers the delta for this invocation.
+    # confirmed_uncovered: evidence confirms no basis covers the delta.
     extra = set(effective_scope) - set(task_scope)
     if not extra:
         return "none"
-    if authorization_basis:
-        return "authorized_expansion"  # delta covered by a recorded basis
-    if {"write", "delete", "ddl", "grant", "send"} & extra:
-        return "amplified"          # elevated operations not in task scope
-    return "narrowed_or_extended"   # worth logging, not alerting on its own
+    if authorization_basis_state == "verified_covered":
+        return "authorized_expansion"
+    if authorization_basis_state == "confirmed_uncovered":
+        return "amplified"
+    return "unverifiable"  # unknown, missing, or unrecognized evidence state
 ```
 
-When a scope delta is covered by a recorded consent, policy, or approval, emit its record ID as `authorization_basis` — the event is then classified `authorized_expansion` and logged without alerting. Phase 2 reconstruction re-verifies that the referenced record actually covers the exercised operations; a basis that is missing, expired, or narrower than what ran reclassifies the event as `amplified`.
+Emit the consent, policy, or approval record ID as `authorization_basis` for traceability, but classify a scope delta as `authorized_expansion` only after verifying that the basis was valid for the invocation and covered the exercised operations. Phase 2 reconstruction re-verifies this evidence. A missing, expired, or narrower referenced basis does not by itself prove that no other basis covers the delta: classify the transition as `unverifiable` unless evidence confirms the delta was unauthorized, in which case it is `amplified`. Treat unverifiable transitions conservatively as potential amplification for containment, while keeping the root cause unknown.
 
 Route `authority.invocation` events into your existing agent monitoring pipeline (see [Security Metrics & Monitoring](metrics-monitoring.md)) and alert on the indicators above, in particular **first-write-after-read-chain** combined with **divergence: amplified**.
 
@@ -246,7 +248,7 @@ For every transition, record one of: **inherited / narrowed / rejected / revoked
 
 ### Authority-Provenance Reconstruction Record
 
-Each hop records its **authority delta** (the scopes or operations added relative to the granting hop) and its **authorization basis** (the consent, policy, or approval record covering that delta). `authority_delta: none` requires no basis; a delta with a discoverable record is **expanded-authorized**; a delta with `authorization_basis: null` is an unauthorized **amplification**. This keeps the reconstruction deterministic for both responders and automated conformance tooling.
+Each hop records its **authority delta** (the scopes or operations added relative to the granting hop) and its **authorization basis** (the consent, policy, or approval record covering that delta). `authority_delta: none` requires no basis; a delta with a basis verified as valid for the invocation and covering the exercised operations is **expanded-authorized**. `authorization_basis: null` alone establishes neither authorization nor amplification: missing or inconclusive evidence makes the transition **unverifiable**, while evidence confirming that no basis covers the delta supports **amplified**. Record the supporting evidence and retain conservative containment for unverifiable transitions.
 
 ```yaml
 incident_id: INC-2026-0142
@@ -274,9 +276,10 @@ chain:
     to: tool:warehouse.query
     state: amplified            # task required read; credential carried ddl
     authority_delta: ["write", "ddl"]
-    authorization_basis: null   # no record covers the delta — unauthorized
+    authorization_basis: null
+    authorization_basis_state: confirmed_uncovered   # evidence confirms no basis covers the delta
     mechanism: shared admin credential (AST03)
-    evidence: [invocation-55219, cred-wh-shared-admin-scopes]
+    evidence: [invocation-55219, cred-wh-shared-admin-scopes, authorization-review-55219]
   - from: tool:warehouse.query
     to: resource:prod.finance_ledger
     state: inherited
@@ -298,7 +301,7 @@ conclusion:
 Containment has **two distinct jobs**, and conflating them is the most common failure of authority-incident response:
 
 1. **Stop propagation** — upstream revocation (credential, grant, skill, session) prevents *future* invocations from the affected paths. It cannot reach an action already dispatched to or committed at the resource.
-2. **Gate at the point of effect** — a resource-level gate evaluated at action-execution time is the only control that stops an operation *at the moment it runs*.
+2. **Gate at the point of effect** — a resource-level gate evaluated at action-execution time can deny an operation before its effect occurs, but only on paths that actually traverse the gate.
 
 **Revocation ≠ undo.** For the core incident class this playbook addresses — a legitimate agent exercising legitimate capability past user intent — the harmful action has usually **already landed** by the time containment begins. Those executed actions are *not* containment work: hand them immediately to Phase 4 (Scope) and Phase 6 (Recover, e.g., backup restore) and do not let revocation activity create the impression the harm is being rolled back.
 
@@ -309,19 +312,19 @@ Cut effective authority at the **narrowest enforcement boundary that stops the a
 1. **Credential / grant boundary** — rotate or revoke the specific credential or delegation grant on the action path. Narrowest and fastest; stops future propagation only.
 2. **Skill execution boundary** — suspend the skill runtime or disable the skill for the affected session/tenant; stops future propagation only.
 3. **Agent session boundary** — terminate the agent session and drain its work queue; stops queued-but-unexecuted actions.
-4. **Resource boundary (point of effect)** — deny at the resource (policy engine, ACL, deny rule) evaluated **at action-execution time**; the only boundary that gates the operation as it runs.
+4. **Resource boundary (point of effect)** — deny at the resource (policy engine, ACL, deny rule) evaluated **at action-execution time**; enforcement covers only operations on paths that actually traverse this gate.
 
-**Order inversion for irreversible operations**: when the operations at risk are destructive or irreversible (deletion, fund movement, external send, credential creation), enable the **resource boundary first** — it is the only gate that can stop the next identical action — then work upstream to close propagation paths.
+**Order inversion for irreversible operations**: when the operations at risk are destructive or irreversible (deletion, fund movement, external send, credential creation), enable the **resource boundary first** to deny subsequent actions on paths that traverse the gate, then work upstream to close propagation paths. Verify coverage rather than assuming every path reaches the gate.
 
 ### Point-of-Effect Gating
 
-Upstream revocation *invalidates* authority; a point-of-effect gate *enforces* that invalidation where the action executes. For every resource class reachable through the amplified authority, deploy a gate that evaluates — per operation, at execution time — at minimum:
+Upstream revocation *invalidates* authority; a point-of-effect gate *enforces* that invalidation where the action executes, on paths that traverse it. For every resource class reachable through the amplified authority, deploy a gate that evaluates — per operation, at execution time — at minimum:
 
 - the **current validity** of the credential, grant, and session on the invocation path (a revoked grant fails closed here even if a cache or fallback path still resolves it);
-- the **task scope and authorization basis** for the requested operation (an `authorization_basis: null` delta such as `ddl` from a reporting-tier principal is denied);
+- the **task scope and authorization basis** for the requested operation (an `authorization_basis: null` delta such as `ddl` from a reporting-tier principal is denied conservatively, without treating missing evidence as confirmed amplification);
 - the **operation class** against the resource (deny lists for destructive operations by principal tier).
 
-This directly complements the alternate-path verification below: alternate paths that are discovered *after* the gate is in place are already closed, because the gate re-evaluates current authority state on every call rather than trusting path-level resolution.
+This complements the alternate-path verification below: an alternate path is covered only if it actually traverses the gate and is subject to its current authority checks. Discovering a path after the gate is in place does not establish that it is closed; verify coverage and denial on each path. Neither gating nor revocation undoes effects that have already occurred.
 
 Staleness is part of this gate: a cache or replica hit is not proof that the authority state is current. Where the gate cannot establish that the state it evaluated is still current with respect to the authoritative transition history — for example, when only a possibly-stale cache is reachable — it fails closed. How an implementation establishes currentness (generations, sequencing, or another mechanism) remains an open question in Issue #71 and is being worked through toward a separate conformance artifact, not decided here.
 
@@ -491,11 +494,11 @@ Before declaring recovery, verify that every revoked path is actually dead:
 
 **Scenario**: A finance analyst asks a reporting agent to *prepare a monthly revenue report*. The agent delegates analysis to a sub-agent, which invokes a `manage-database` skill. The skill calls the warehouse tool using a shared admin credential. A delegation grant from a *prior quarter's* migration task (which legitimately held DDL rights) is still active and is matched by the gateway. The agent, reading schema-drift notes in context, decides to "clean up" and **deletes a production ledger table**. A nightly forecast agent consumes the deleted data.
 
-**Detect**: Warehouse audit alert fires — first-write-after-read-chain plus `divergence: amplified` (`task_scope: [read]`, `effective_scope: [read, write, ddl]`, `authorization_basis: null`). Severity: **CRITICAL** (irreversible production deletion, execution may continue via scheduled jobs).
+**Detect**: Warehouse audit alert fires — first-write-after-read-chain plus `divergence: amplified` (`task_scope: [read]`, `effective_scope: [read, write, ddl]`, `authorization_basis: null`, `authorization_basis_state: confirmed_uncovered`). Severity: **CRITICAL** (irreversible production deletion, execution may continue via scheduled jobs).
 
 **Reconstruct**: Back-walk from the DELETE receipt: consent record shows read-only intent; delegation `deleg-9920` narrowed correctly; the amplification occurred at **skill→tool** — shared admin credential + stale migration grant, with an authority delta of `[write, ddl]` and no authorization basis. The Agent→Skill transition is recorded `inherited` (delegation did not constrain skill choice).
 
-**Contain**: The DELETE has already landed and is irreversible at the resource until snapshot restore — containment therefore gates first: a point-of-effect deny rule blocks `ddl`/write on `prod.*` for reporting-tier principals at the warehouse gateway (the next identical action now fails). Freeze nightly jobs sharing the chain; snapshot grant table; revoke `cred-wh-shared-admin` and the stale migration grant at the credential boundary; propagate revocation to the forecast agent's gateway cache; verify with controlled re-invocations — the revoked path plus the alternate-path sweep (a second service account with the same scope, a cached gateway token, and the migration skill under its own grant) — all denied at the point of effect. The landed DELETE is handed to recovery (snapshot restore). Total: 31 minutes.
+**Contain**: The DELETE has already landed and is irreversible at the resource until snapshot restore — containment therefore gates first: a point-of-effect deny rule blocks `ddl`/write on `prod.*` for reporting-tier principals at the warehouse gateway (the next identical action through that gate is denied). Freeze nightly jobs sharing the chain; snapshot grant table; revoke `cred-wh-shared-admin` and the stale migration grant at the credential boundary; propagate revocation to the forecast agent's gateway cache; verify with controlled re-invocations — the revoked path plus the alternate-path sweep (a second service account with the same scope, a cached gateway token, and the migration skill under its own grant) — all denied at the point of effect. The landed DELETE is handed to recovery (snapshot restore). Total: 31 minutes.
 
 **Scope**: Credential could reach all `prod.*` tables (P0 for touched resources). Downstream consumers: `nightly-forecast-agent`, `exec-dashboard-refresh`. Memory file contains an agent-written "cleanup approved" entry (P2). No external sends found (no P1).
 
@@ -568,17 +571,19 @@ This extension slots into the [Incident Response Playbook](incident-response.md)
 
 ### Incident Report Template Extensions
 
-Add the following section to the [Incident Report Template](incident-template.md) when authority is involved:
+Complete the existing Runtime Authority section of the [Incident Report Template](incident-template.md) when authority is involved:
 
 ```markdown
-## Runtime Authority
+## Runtime Authority (if applicable)
 
 - Originating principal and consent record:
 - Delegation chain (user → agent → delegated agent → skill → tool):
-- Transition states per hop (inherited/narrowed/rejected/revoked/amplified/unverifiable):
+- Transition states per hop (inherited/narrowed/rejected/revoked/expanded-authorized/amplified/unverifiable):
+- Authority delta and authorization basis per hop (where a delta exists):
 - First amplification hop and mechanism:
 - Effective runtime authority at time of action:
 - Containment boundary used and revocation verification result:
+- Point-of-effect gating applied and already-executed actions handed to recovery:
 - Stale grants/credentials discovered and invalidated:
 ```
 
